@@ -22,28 +22,28 @@
   extraRuntimeDependencies ? [ ],
   installPath ? [ "$HOME/.vscode-server" ],
   postPatch ? "",
-}: let
+}:
+let
   inherit (lib) makeBinPath makeLibraryPath optionalString;
 
   # Based on: https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/applications/editors/vscode/generic.nix
-  runtimeDependencies =
-    [
-      stdenv.cc.libc
-      stdenv.cc.cc
+  runtimeDependencies = [
+    stdenv.cc.libc
+    stdenv.cc.cc
 
-      # dotnet
-      curl
-      icu
-      libunwind
-      libuuid
-      lttng-ust
-      openssl
-      zlib
+    # dotnet
+    curl
+    icu
+    libunwind
+    libuuid
+    lttng-ust
+    openssl
+    zlib
 
-      # mono
-      krb5
-    ]
-    ++ extraRuntimeDependencies;
+    # mono
+    krb5
+  ]
+  ++ extraRuntimeDependencies;
 
   nodejs = nodejsPackage;
   nodejsFHS = buildFHSEnv {
@@ -68,7 +68,11 @@
 
   patchELFScript = writeShellApplication {
     name = "patchelf-vscode-server";
-    runtimeInputs = [ coreutils findutils patchelf ];
+    runtimeInputs = [
+      coreutils
+      findutils
+      patchelf
+    ];
     text = ''
       bin_dir="$1"
       patched_file="$bin_dir/.nixos-patched"
@@ -111,16 +115,25 @@
         done < <(find "$bin_dir" -type f -perm -100 -printf '%p\0')
       ''}
 
+      # Fix up home-manager session variables sourcing.
+      find "$bin_dir/bin" -type f -name "code-server*" -exec sed -i '$i unset __HM_SESS_VARS_SOURCED\n' {} \;
+
       # Mark the bin directory as being fully patched.
       echo 1 > "$patched_file"
 
-      ${optionalString (postPatch != "") ''${writeShellScript "post-patchelf-vscode-server" postPatch} "$bin_dir"''}
+      ${optionalString (
+        postPatch != ""
+      ) ''${writeShellScript "post-patchelf-vscode-server" postPatch} "$bin_dir"''}
     '';
   };
 
   autoFixScript = writeShellApplication {
     name = "auto-fix-vscode-server";
-    runtimeInputs = [ coreutils findutils inotify-tools ];
+    runtimeInputs = [
+      coreutils
+      findutils
+      inotify-tools
+    ];
     text = ''
       # Convert installPath list to an array
       IFS=':' read -r -a installPaths <<< "${lib.concatStringsSep ":" installPath}"
@@ -154,30 +167,35 @@
         mv "$actual_dir/node" "$actual_dir/node.patched"
 
         ${optionalString (enableFHS) ''
-        ln -sfT ${nodejsFHS}/bin/node "$actual_dir/node"
-      ''}
+          ln -sfT ${nodejsFHS}/bin/node "$actual_dir/node"
+        ''}
 
         ${optionalString (!enableFHS || postPatch != "") ''
-        cat <<EOF > "$actual_dir/node"
-        #!${runtimeShell}
+          cat <<EOF > "$actual_dir/node"
+          #!${runtimeShell}
 
-        # The core utilities are missing in the case of WSL, but required by Node.js.
-        PATH="\''${PATH:+\''${PATH}:}${makeBinPath [ coreutils ]}"
+          # The core utilities are missing in the case of WSL, but required by Node.js.
+          PATH="\''${PATH:+\''${PATH}:}${makeBinPath [ coreutils ]}"
 
-        # We leave the rest up to the Bash script
-        # to keep having to deal with 'sh' compatibility to a minimum.
-        ${patchELFScript}/bin/patchelf-vscode-server \$(dirname "\$0")
+          # We leave the rest up to the Bash script
+          # to keep having to deal with 'sh' compatibility to a minimum.
+          ${patchELFScript}/bin/patchelf-vscode-server \$(dirname "\$0")
 
-        # Let Node.js take over as if this script never existed.
-        ${
-          let nodePath = (if (nodejs != null)
-          then "${if enableFHS then nodejsFHS else nodejs}/bin/node"
-          else ''\$(dirname "\$0")/node.patched'');
-          in ''exec "${nodePath}" "\$@"''
-        }
-        EOF
-        chmod +x "$actual_dir/node"
-      ''}
+          # Let Node.js take over as if this script never existed.
+          ${
+            let
+              nodePath = (
+                if (nodejs != null) then
+                  "${if enableFHS then nodejsFHS else nodejs}/bin/node"
+                else
+                  ''\$(dirname "\$0")/node.patched''
+              );
+            in
+            ''exec "${nodePath}" "\$@"''
+          }
+          EOF
+          chmod +x "$actual_dir/node"
+        ''}
 
         # Mark the bin directory as being patched.
         echo 0 > "$patched_file"
