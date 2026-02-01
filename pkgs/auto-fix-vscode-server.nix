@@ -116,7 +116,7 @@ let
       ''}
 
       # Fix up home-manager session variables sourcing.
-      find "$bin_dir/bin" -type f -name "code-server*" -exec sed -i '$i unset __HM_SESS_VARS_SOURCED\n' {} \;
+      find "$bin_dir/bin" -type f -name "code-server*" -o -name "cursor-server" -exec sed -i '$i unset __HM_SESS_VARS_SOURCED\n' {} \;
 
       # Mark the bin directory as being fully patched.
       echo 1 > "$patched_file"
