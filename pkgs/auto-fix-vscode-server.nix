@@ -20,7 +20,10 @@
   enableFHS ? false,
   nodejsPackage ? null,
   extraRuntimeDependencies ? [ ],
-  installPath ? [ "$HOME/.vscode-server" ],
+  installPath ? [
+    "$HOME/.vscode-server"
+    "$HOME/.cursor-server"
+  ],
   postPatch ? "",
 }:
 let
@@ -116,7 +119,7 @@ let
       ''}
 
       # Fix up home-manager session variables sourcing.
-      find "$bin_dir/bin" -type f -name "code-server*" -o -name "cursor-server" -exec sed -i '$i unset __HM_SESS_VARS_SOURCED\n' {} \;
+      find "$bin_dir/bin" -type f \( -name "code-server*" -o -name "cursor-server" \) -exec sed -i '$i unset __HM_SESS_VARS_SOURCED\n' {} \;
 
       # Mark the bin directory as being fully patched.
       echo 1 > "$patched_file"
@@ -142,6 +145,10 @@ let
         local actual_dir="$1"
         local current_install_path="$2"
         local patched_file="$actual_dir/.nixos-patched"
+
+        if [[ ! -e "$actual_dir/node" ]]; then
+          return 0
+        fi
 
         if [[ -e $patched_file ]]; then
           return 0
@@ -205,54 +212,97 @@ let
       bins_dirs_1=()
       bins_dirs_2=()
 
+      # Use a delimiter-separated string to map bins_dir -> install_path
+      # Format: "bins_dir1|install_path1:bins_dir2|install_path2:..."
+      bins_to_install_map=""
+
       # Populate bins_dirs_1 and bins_dirs_2 based on installPaths
       for current_install_path in "''${installPaths[@]}"; do
         bins_dirs_1+=("$current_install_path/bin")
+        bins_to_install_map+="$current_install_path/bin|$current_install_path:"
+        shopt -s nullglob
+        for platform_dir in "$current_install_path/bin/"*; do
+          if [[ -d "$platform_dir" ]]; then
+            bins_dirs_1+=("$platform_dir")
+            bins_to_install_map+="$platform_dir|$current_install_path:"
+          fi
+        done
+        shopt -u nullglob
         bins_dirs_2+=("$current_install_path/cli/servers")
+        bins_to_install_map+="$current_install_path/cli/servers|$current_install_path:"
       done
+
+      # Helper function to get install path from bins_dir
+      get_install_path () {
+        local target_dir="$1"
+        local entry
+        IFS=':' read -ra entries <<< "$bins_to_install_map"
+        for entry in "''${entries[@]}"; do
+          if [[ "$entry" == "$target_dir|"* ]]; then
+            echo "''${entry#*|}"
+            return 0
+          fi
+        done
+        # Fallback: try to infer from path structure
+        dirname "$target_dir"
+      }
 
       # Create directories and patch existing bins
       for bins_dir_1 in "''${bins_dirs_1[@]}"; do
         mkdir -p "$bins_dir_1"
+        install_path="$(get_install_path "$bins_dir_1")"
         while read -rd ''' bin; do
-          patch_bin "$bin" "$(dirname "$(dirname "$bin")")"
+          if [[ ! -e "$bin/node" ]]; then
+            continue
+          fi
+          patch_bin "$bin" "$install_path"
         done < <(find "$bins_dir_1" -mindepth 1 -maxdepth 1 -type d -printf '%p\0')
       done
       for bins_dir_2 in "''${bins_dirs_2[@]}"; do
         mkdir -p "$bins_dir_2"
+        install_path="$(get_install_path "$bins_dir_2")"
         while read -rd ''' bin; do
           bin="$bin/server"
-          patch_bin "$bin" "$(dirname "$(dirname "$bin")")"
+          patch_bin "$bin" "$install_path"
         done < <(find "$bins_dir_2" -mindepth 1 -maxdepth 1 -type d -printf '%p\0')
       done
 
-      # Watch for new installations
-      while IFS=: read -r bins_dir bin event; do
-        # A new version of the VS Code Server is being created.
-        if [[ $event == 'CREATE,ISDIR' ]]; then
-          actual_dir="$bins_dir$bin"
-          actual_install_path="$(dirname "$bins_dir")"
-          if [[ "$bins_dir" == */cli/servers/ ]]; then
-            actual_dir="$actual_dir/server"
-            # Hope that VSCode will not die if the directory exists when it tries to install, otherwise we'll need to
-            # use a coproc to wait for the directory to be created without entering in a race, then watch for the node
-            # file to be created (probably while also avoiding a race)
-            # https://unix.stackexchange.com/a/185370
-            mkdir -p "$actual_dir"
-            actual_install_path="$(dirname "$(dirname "$bins_dir")")"
+      # Watch for new installations by monitoring node file creation
+      while IFS=: read -r filepath event; do
+        if [[ $event == 'CREATE' || $event == 'MOVED_TO' ]]; then
+          # node file was created or moved
+          if [[ "$filepath" == */node ]]; then
+            node_file="$filepath"
+            actual_dir="$(dirname "$node_file")"
+            
+            # Find install path
+            install_path=""
+            for check_dir in "''${bins_dirs_1[@]}" "''${bins_dirs_2[@]}"; do
+              if [[ "$actual_dir" == "$check_dir"/* ]]; then
+                install_path="$(get_install_path "$check_dir")"
+                break
+              fi
+            done
+            
+            if [[ -z "$install_path" ]]; then
+              continue
+            fi
+            
+            # Skip if already patched
+            if [[ -e "$actual_dir/.nixos-patched" ]]; then
+              continue
+            fi
+            
+            echo "VS Code/Cursor server installation detected in $actual_dir, patching..." >&2
+            sleep 0.5
+            patch_bin "$actual_dir" "$install_path"
           fi
-          echo "VS Code server is being installed in $actual_dir..." >&2
-          # Quickly create a node file, which will be removed when vscode installs its own version
-          touch "$actual_dir/node"
-          # Hope we don't race...
-          inotifywait -qq -e DELETE_SELF "$actual_dir/node"
-          patch_bin "$actual_dir" "$actual_install_path"
-        # The monitored directory is deleted, e.g. when "Uninstall VS Code Server from Host" has been run.
+          
         elif [[ $event == DELETE_SELF ]]; then
-          # See the comments above Restart in the service config.
+          # The monitored directory is deleted
           exit 0
         fi
-      done < <(inotifywait -q -m -e CREATE,ISDIR -e DELETE_SELF --format '%w:%f:%e' "''${bins_dirs_1[@]}" "''${bins_dirs_2[@]}")
+      done < <(inotifywait -q -m -r -e CREATE -e MOVED_TO -e DELETE_SELF --format '%w%f:%e' "''${bins_dirs_1[@]}" "''${bins_dirs_2[@]}")
     '';
   };
 in
